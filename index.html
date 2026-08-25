@@ -299,6 +299,7 @@ function Room({ profile, room }) {
 
   /* ------------------------- YouTube player ------------------------- */
   const playerRef = useRef(null);
+  const playerHostRef = useRef(null);
   const readyRef = useRef(false);
   const curPlayId = useRef(null);
   const tapTimer = useRef(null);
@@ -360,8 +361,12 @@ function Room({ profile, room }) {
     let cancelled = false;
     const create = () => {
       if (cancelled || playerRef.current) return;
+      const host = playerHostRef.current;
+      if (!host) return;
       try {
-        playerRef.current = new window.YT.Player("yt-player", {
+        const mount = document.createElement("div");
+        host.appendChild(mount);
+        playerRef.current = new window.YT.Player(mount, {
           width: "100%", height: "100%",
           playerVars: { autoplay: 1, playsinline: 1, rel: 0, modestbranding: 1 },
           events: { onReady: () => { readyRef.current = true; sync(true); }, onStateChange: onState },
@@ -474,7 +479,7 @@ function Room({ profile, room }) {
             <div style={eyebrow}><EqBars active={isPlaying} /><span>กำลังเล่น</span></div>
             <div style={playerWrap}>
               {np && <div style={{ ...blurBg, backgroundImage: "url(" + thumb(np.videoId) + ")" }} />}
-              {!apiFailed && <div id="yt-player" style={{ position: "absolute", inset: 0, borderRadius: 14 }} />}
+              {!apiFailed && <div ref={playerHostRef} style={{ position: "absolute", inset: 0, borderRadius: 14 }} />}
               {apiFailed && np && (
                 <iframe key={np.playId} title="player"
                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: 0, borderRadius: 14 }}
