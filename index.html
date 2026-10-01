@@ -59,6 +59,9 @@ const firebaseConfig = {
    → Credentials → Create API key
    ถ้าปล่อยว่างไว้ ยังวางลิงก์ YouTube เข้าคิวได้ตามปกติ แค่ค้นหาด้วยชื่อเพลงไม่ได้
    ===================================================================== */
+// songs queued automatically when a new room is created
+const STARTER_VIDEO_ID = "LCuxGozZh7c";
+const STARTER_REPEAT = 10;
 const YOUTUBE_API_KEY = "AIzaSyDHGG5AXtIMyXsuW3H1UKGfaOfLKxgCp_w";
 /* ===================================================================== */
 
@@ -149,6 +152,9 @@ const Play  = (p) => <Ic {...p}><polygon points="6 3 20 12 6 21" fill="currentCo
 const Pause = (p) => <Ic {...p}><rect x="6" y="4" width="4" height="16" fill="currentColor" stroke="none" rx="1"/><rect x="14" y="4" width="4" height="16" fill="currentColor" stroke="none" rx="1"/></Ic>;
 const Skip  = (p) => <Ic {...p}><polygon points="5 4 15 12 5 20" fill="currentColor" stroke="none"/><line x1="19" y1="5" x2="19" y2="19"/></Ic>;
 const Plus  = (p) => <Ic {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></Ic>;
+const ChevUp = (p) => <Ic {...p}><polyline points="6 15 12 9 18 15"/></Ic>;
+const ChevDn = (p) => <Ic {...p}><polyline points="6 9 12 15 18 9"/></Ic>;
+const Star  = (p) => <Ic {...p}><polygon points="12 2 15.1 8.6 22 9.3 16.8 14 18.2 21 12 17.4 5.8 21 7.2 14 2 9.3 8.9 8.6" fill="currentColor" stroke="none"/></Ic>;
 const XIcon = (p) => <Ic {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></Ic>;
 const UsersI= (p) => <Ic {...p}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></Ic>;
 const Vol   = (p) => <Ic {...p}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></Ic>;
@@ -255,6 +261,7 @@ function Room({ profile, room }) {
   useEffect(() => { sharedRef.current = shared; }, [shared]);
 
   const [members, setMembers] = useState({});
+  const [hostId, setHostId] = useState(null);
   const [input, setInput] = useState("");
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState(false);
@@ -296,6 +303,36 @@ function Room({ profile, room }) {
     const hb = setInterval(() => meRef.update({ lastSeen: serverNow() }), 15000);
     return () => { mRef.off("value", cb); clearInterval(hb); meRef.remove(); meRef.onDisconnect().cancel(); };
   }, [room, profile]);
+
+  /* room host: first person to enter the room */
+  useEffect(() => {
+    const hRef = db.ref("rooms/" + room + "/hostId");
+    let claimed = false;
+    hRef.transaction((cur) => { claimed = !cur; return cur || profile.id; }, (error, committed) => {
+      if (error || !committed || !claimed) return;
+      // a brand-new room has no hostId yet; seed its empty queue with the starter song
+      mutate((s) => {
+        if (s.nowPlaying || s.queue.length) return undefined;
+        const at = serverNow();
+        s.queue = Array.from({ length: STARTER_REPEAT }, (_, i) => ({
+          playId: uid(), videoId: STARTER_VIDEO_ID, title: null,
+          addedBy: profile.name, addedById: profile.id, addedAt: at + i,
+        }));
+        return s;
+      }).then(() => fetchTitle(STARTER_VIDEO_ID)).then((title) => {
+        if (!title) return;
+        mutate((s) => {
+          let hit = false;
+          const fill = (x) => (x && x.videoId === STARTER_VIDEO_ID && !x.title ? (hit = true, Object.assign({}, x, { title })) : x);
+          s.queue = s.queue.map(fill);
+          s.nowPlaying = fill(s.nowPlaying);
+          return hit ? s : undefined;
+        });
+      });
+    });
+    const cb = hRef.on("value", (snap) => setHostId(snap.val()));
+    return () => hRef.off("value", cb);
+  }, [room, profile, mutate]);
 
   /* ------------------------- YouTube player ------------------------- */
   const playerRef = useRef(null);
@@ -421,10 +458,10 @@ function Room({ profile, room }) {
   };
   const runSearch = async (query) => {
     if (!YOUTUBE_API_KEY) { setErr("ค้นหาเพลงต้องตั้งค่า YOUTUBE_API_KEY ก่อน (ดูคอมเมนต์บนสุดของโค้ด) หรือวางลิงก์ YouTube แทน"); return; }
-    setErr(""); setResults([]); setSearching(true);
+    setErr(""); setSearching(true);
     const items = await searchYouTube(query);
     setSearching(false);
-    if (!items.length) { setErr("ไม่พบผลลัพธ์ ลองคำค้นอื่นดูนะ"); return; }
+    if (!items.length) { setResults([]); setErr("ไม่พบผลลัพธ์ ลองคำค้นอื่นดูนะ"); return; }
     setResults(items);
   };
   const addSong = () => {
@@ -439,6 +476,13 @@ function Room({ profile, room }) {
     setInput(""); setResults([]); setErr("");
   };
   const removeSong = (playId) => mutate((s) => { s.queue = (s.queue || []).filter((x) => x.playId !== playId); return s; });
+  const moveSong = (playId, dir) => mutate((s) => {
+    const q = [...(s.queue || [])];
+    const i = q.findIndex((x) => x.playId === playId), j = i + dir;
+    if (i < 0 || j < 0 || j >= q.length) return undefined;
+    [q[i], q[j]] = [q[j], q[i]];
+    s.queue = q; return s;
+  });
   const skip = () => advance(null);
   const togglePlay = () => { const p = playerRef.current; if (!p) return; try { isPlaying ? p.pauseVideo() : (p.playVideo(), setNeedsTap(false)); } catch (e) {} };
   const toggleMute = () => { const p = playerRef.current; if (!p) return; try { muted ? p.unMute() : p.mute(); setMuted(!muted); } catch (e) {} };
@@ -447,7 +491,10 @@ function Room({ profile, room }) {
 
   /* ---------------------------- render ---------------------------- */
   const np = shared.nowPlaying;
-  const online = Object.values(members).filter((m) => serverNow() - (m.lastSeen || 0) < 30000);
+  const online = Object.entries(members)
+    .map(([id, m]) => Object.assign({ id }, m))
+    .filter((m) => serverNow() - (m.lastSeen || 0) < 30000)
+    .sort((a, b) => (b.id === hostId) - (a.id === hostId));
   const elapsedStart = np ? Math.max(0, Math.floor((serverNow() - np.startedAt) / 1000)) : 0;
 
   return (
@@ -466,7 +513,10 @@ function Room({ profile, room }) {
             <UsersI size={16} />
             <div style={{ display: "flex" }}>
               {online.slice(0, 6).map((m, i) => (
-                <div key={i} title={m.name} style={{ ...avatar, marginLeft: i ? -8 : 0 }}>{initials(m.name)}</div>
+                <div key={m.id} title={m.id === hostId ? m.name + " (หัวห้อง)" : m.name} style={{ ...avatar, position: "relative", zIndex: m.id === hostId ? 1 : 0, marginLeft: i ? -8 : 0 }}>
+                  {initials(m.name)}
+                  {m.id === hostId && <span style={hostStar}><Star size={10} /></span>}
+                </div>
               ))}
             </div>
             <span style={{ color: C.muted, fontSize: 13, marginLeft: 4 }}>{online.length} ออนไลน์</span>
@@ -517,7 +567,7 @@ function Room({ profile, room }) {
             <div style={{ marginTop: 18 }}>
               <div style={{ display: "flex", gap: 8 }}>
                 <input style={{ ...inp, marginTop: 0, flex: 1 }} value={input}
-                  onChange={(e) => { setInput(e.target.value); setErr(""); if (results.length) setResults([]); }}
+                  onChange={(e) => { setInput(e.target.value); setErr(""); }}
                   onKeyDown={(e) => e.key === "Enter" && addSong()} placeholder="วางลิงก์ YouTube หรือพิมพ์ชื่อเพลงเพื่อค้นหา…" />
                 <button onClick={addSong} style={primaryBtn} disabled={searching}>
                   {extractVideoId(input) ? <Plus size={18} /> : <SearchI size={18} />}
@@ -559,6 +609,10 @@ function Room({ profile, room }) {
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.title || "เพลง YouTube"}</div>
                     <div style={{ fontSize: 12, color: C.muted }}>{s.addedBy}</div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, flexShrink: 0 }}>
+                    <button onClick={() => moveSong(s.playId, -1)} disabled={i === 0} style={{ ...rowMove, opacity: i === 0 ? 0.3 : 1 }} title="เลื่อนขึ้น"><ChevUp size={14} /></button>
+                    <button onClick={() => moveSong(s.playId, 1)} disabled={i === shared.queue.length - 1} style={{ ...rowMove, opacity: i === shared.queue.length - 1 ? 0.3 : 1 }} title="เลื่อนลง"><ChevDn size={14} /></button>
                   </div>
                   <button onClick={() => removeSong(s.playId)} style={rowX} title="เอาออกจากคิว"><XIcon size={15} /></button>
                 </div>
@@ -605,8 +659,10 @@ const primaryBtn = { display: "inline-flex", alignItems: "center", gap: 6, paddi
 const ctrlBtn = { width: 46, height: 46, borderRadius: 14, border: 0, cursor: "pointer", background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" };
 const ctrlBtnGhost = { width: 44, height: 44, borderRadius: 14, cursor: "pointer", background: C.panel2, border: "1px solid " + C.line, color: C.text, display: "flex", alignItems: "center", justifyContent: "center" };
 const roomChip = { display: "inline-flex", alignItems: "center", gap: 8, marginTop: 3, padding: "5px 12px", borderRadius: 999, background: C.panel2, border: "1px solid " + C.line, color: C.text, fontSize: 15, cursor: "pointer" };
+const hostStar = { position: "absolute", top: -6, right: -6, width: 16, height: 16, borderRadius: 999, background: "#f5b301", color: "#fff", border: "2px solid " + C.bg, display: "flex", alignItems: "center", justifyContent: "center" };
 const avatar = { width: 30, height: 30, borderRadius: 999, background: "linear-gradient(135deg, " + C.accent2 + ", " + C.accent + ")", color: "#fff", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", border: "2px solid " + C.bg };
 const queueRow = { display: "flex", alignItems: "center", gap: 10, padding: 8, borderRadius: 12, background: C.panel2, border: "1px solid " + C.line };
+const rowMove = { width: 30, height: 19, borderRadius: 6, cursor: "pointer", background: "transparent", border: "1px solid " + C.line, color: C.muted, display: "flex", alignItems: "center", justifyContent: "center", padding: 0 };
 const rowX = { width: 30, height: 30, borderRadius: 9, flexShrink: 0, cursor: "pointer", background: "transparent", border: "1px solid " + C.line, color: C.muted, display: "flex", alignItems: "center", justifyContent: "center" };
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
