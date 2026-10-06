@@ -74,6 +74,8 @@ if (!NEEDS_SETUP) {
   db = firebase.database();
   db.ref(".info/serverTimeOffset").on("value", (s) => { serverOffset = s.val() || 0; });
 }
+const ONLINE_MS = 30000; // a member counts as online if their heartbeat is newer than this
+const ENDED_SLACK_SEC = 8; // how early an "ended" report may arrive and still advance the queue
 const serverNow = () => Date.now() + serverOffset;
 
 const { useState, useEffect, useRef, useCallback } = React;
@@ -187,7 +189,7 @@ function App() {
         setPhase("room");
       }} />
   ) : (
-    <Room profile={profile} room={room} />
+    <RoomGate profile={profile} room={room} />
   );
 }
 
@@ -253,6 +255,61 @@ function JoinScreen({ profile, onJoin }) {
   );
 }
 
+/* ============================ ROOM GATE ============================= */
+/* A room with nobody online counts as closed: the next person to enter wipes the old
+   data (queue, now playing, host) and starts it fresh as host, seeded with the starter song. */
+function RoomGate({ profile, room }) {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const roomRef = db.ref("rooms/" + room);
+    let fresh = false;
+    roomRef.transaction((cur) => {
+      const members = (cur && cur.members) || {};
+      const someoneHere = Object.keys(members).some((id) => serverNow() - ((members[id] || {}).lastSeen || 0) < ONLINE_MS);
+      fresh = !someoneHere;
+      if (someoneHere) return undefined;
+      const at = serverNow();
+      return {
+        hostId: profile.id,
+        members: { [profile.id]: { name: profile.name, lastSeen: at } },
+        state: {
+          nowPlaying: null,
+          queue: Array.from({ length: STARTER_REPEAT }, (_, i) => ({
+            playId: uid(), videoId: STARTER_VIDEO_ID, title: null,
+            addedBy: profile.name, addedById: profile.id, addedAt: at + i,
+          })),
+        },
+      };
+    }, (error, committed) => {
+      if (cancelled) return;
+      setReady(true);
+      if (error || !committed || !fresh) return;
+      fetchTitle(STARTER_VIDEO_ID).then((title) => {
+        if (!title) return;
+        db.ref("rooms/" + room + "/state").transaction((st) => {
+          if (!st) return undefined;
+          let hit = false;
+          const fill = (x) => (x && x.videoId === STARTER_VIDEO_ID && !x.title ? (hit = true, Object.assign({}, x, { title })) : x);
+          st.queue = normQueue(st.queue).map(fill);
+          st.nowPlaying = fill(st.nowPlaying || null);
+          return hit ? st : undefined;
+        });
+      });
+    }, false);
+    return () => { cancelled = true; };
+  }, [room, profile]);
+
+  if (!ready) {
+    return (
+      <div style={{ ...page, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <p style={{ color: C.muted, fontSize: 15 }}>กำลังเข้าห้อง {room.toUpperCase()}…</p>
+      </div>
+    );
+  }
+  return <Room profile={profile} room={room} />;
+}
+
 /* =============================== ROOM =============================== */
 function Room({ profile, room }) {
   const stateRef = useRef(db.ref("rooms/" + room + "/state"));
@@ -304,35 +361,12 @@ function Room({ profile, room }) {
     return () => { mRef.off("value", cb); clearInterval(hb); meRef.remove(); meRef.onDisconnect().cancel(); };
   }, [room, profile]);
 
-  /* room host: first person to enter the room */
+  /* room host: set when the room is (re)created in RoomGate */
   useEffect(() => {
     const hRef = db.ref("rooms/" + room + "/hostId");
-    let claimed = false;
-    hRef.transaction((cur) => { claimed = !cur; return cur || profile.id; }, (error, committed) => {
-      if (error || !committed || !claimed) return;
-      // a brand-new room has no hostId yet; seed its empty queue with the starter song
-      mutate((s) => {
-        if (s.nowPlaying || s.queue.length) return undefined;
-        const at = serverNow();
-        s.queue = Array.from({ length: STARTER_REPEAT }, (_, i) => ({
-          playId: uid(), videoId: STARTER_VIDEO_ID, title: null,
-          addedBy: profile.name, addedById: profile.id, addedAt: at + i,
-        }));
-        return s;
-      }).then(() => fetchTitle(STARTER_VIDEO_ID)).then((title) => {
-        if (!title) return;
-        mutate((s) => {
-          let hit = false;
-          const fill = (x) => (x && x.videoId === STARTER_VIDEO_ID && !x.title ? (hit = true, Object.assign({}, x, { title })) : x);
-          s.queue = s.queue.map(fill);
-          s.nowPlaying = fill(s.nowPlaying);
-          return hit ? s : undefined;
-        });
-      });
-    });
     const cb = hRef.on("value", (snap) => setHostId(snap.val()));
     return () => hRef.off("value", cb);
-  }, [room, profile, mutate]);
+  }, [room]);
 
   /* ------------------------- YouTube player ------------------------- */
   const playerRef = useRef(null);
@@ -361,8 +395,11 @@ function Room({ profile, room }) {
     }
   }, []);
 
-  const advance = useCallback((endedId) => mutate((s) => {
+  const advance = useCallback((endedId, duration) => mutate((s) => {
     if (endedId != null && (!s.nowPlaying || s.nowPlaying.playId !== endedId)) return undefined;
+    // ignore stale/early "ended" reports (e.g. the previous video's ENDED event arriving after
+    // the player switched to the next song) unless the room's clock says the song is nearly done
+    if (endedId != null && duration > 0 && (serverNow() - s.nowPlaying.startedAt) / 1000 < duration - ENDED_SLACK_SEC) return undefined;
     const q = s.queue || [];
     const next = q[0] || null;
     s.nowPlaying = next ? Object.assign({}, next, { startedAt: serverNow() }) : null;
@@ -374,7 +411,15 @@ function Room({ profile, room }) {
     const YT = window.YT; if (!YT) return;
     if (e.data === YT.PlayerState.ENDED) {
       const ended = curPlayId.current;
-      setTimeout(() => advance(ended), 250 + Math.random() * 700);
+      const np = sharedRef.current.nowPlaying;
+      let duration = 0;
+      try { duration = playerRef.current.getDuration() || 0; } catch (e2) {}
+      if (np && np.playId === ended && duration > 0 && (serverNow() - np.startedAt) / 1000 < duration - ENDED_SLACK_SEC) {
+        // spurious end: the room is still mid-song, so get back in sync instead of skipping it
+        setTimeout(() => sync(true), 300);
+        return;
+      }
+      setTimeout(() => advance(ended, duration), 250 + Math.random() * 700);
     } else if (e.data === YT.PlayerState.PLAYING) {
       setIsPlaying(true); setNeedsTap(false);
       try {
@@ -392,7 +437,7 @@ function Room({ profile, room }) {
     } else if (e.data === YT.PlayerState.PAUSED) {
       setIsPlaying(false);
     }
-  }, [advance, mutate]);
+  }, [advance, mutate, sync]);
 
   useEffect(() => {
     let cancelled = false;
@@ -473,7 +518,7 @@ function Room({ profile, room }) {
   };
   const addFromResult = (item) => {
     queueVideo(item.videoId, item.title);
-    setInput(""); setResults([]); setErr("");
+    setErr("");
   };
   const removeSong = (playId) => mutate((s) => { s.queue = (s.queue || []).filter((x) => x.playId !== playId); return s; });
   const moveSong = (playId, dir) => mutate((s) => {
@@ -493,7 +538,7 @@ function Room({ profile, room }) {
   const np = shared.nowPlaying;
   const online = Object.entries(members)
     .map(([id, m]) => Object.assign({ id }, m))
-    .filter((m) => serverNow() - (m.lastSeen || 0) < 30000)
+    .filter((m) => serverNow() - (m.lastSeen || 0) < ONLINE_MS)
     .sort((a, b) => (b.id === hostId) - (a.id === hostId));
   const elapsedStart = np ? Math.max(0, Math.floor((serverNow() - np.startedAt) / 1000)) : 0;
 
@@ -550,9 +595,9 @@ function Room({ profile, room }) {
               )}
             </div>
 
-            <div style={{ marginTop: 14, minHeight: 44 }}>
-              <div style={{ fontSize: 17, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{np ? (np.title || "เพลง YouTube") : "—"}</div>
-              {np && <div style={{ color: C.muted, fontSize: 13, marginTop: 3 }}>เพิ่มโดย {np.addedBy}</div>}
+            <div style={{ marginTop: 14, height: 44 }}>
+              <div style={{ ...oneLine, fontSize: 17, fontWeight: 700, color: C.text, lineHeight: 1.3 }} title={np ? (np.title || "") : ""}>{np ? (np.title || "เพลง YouTube") : "—"}</div>
+              <div style={{ ...oneLine, color: C.muted, fontSize: 13, marginTop: 3 }}>{np ? "เพิ่มโดย " + np.addedBy : " "}</div>
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14 }}>
@@ -569,34 +614,39 @@ function Room({ profile, room }) {
                 <input style={{ ...inp, marginTop: 0, flex: 1 }} value={input}
                   onChange={(e) => { setInput(e.target.value); setErr(""); }}
                   onKeyDown={(e) => e.key === "Enter" && addSong()} placeholder="วางลิงก์ YouTube หรือพิมพ์ชื่อเพลงเพื่อค้นหา…" />
-                <button onClick={addSong} style={primaryBtn} disabled={searching}>
+                <button onClick={addSong} style={{ ...primaryBtn, width: 112, justifyContent: "center" }} disabled={searching}>
                   {extractVideoId(input) ? <Plus size={18} /> : <SearchI size={18} />}
                   {extractVideoId(input) ? " เข้าคิว" : " ค้นหา"}
                 </button>
               </div>
-              {searching && <p style={{ color: C.muted, fontSize: 13, margin: "8px 2px 0" }}>กำลังค้นหา…</p>}
-              {err && <p style={{ color: C.accent, fontSize: 13, margin: "8px 2px 0" }}>{err}</p>}
-              {results.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10, maxHeight: 300, overflowY: "auto" }}>
-                  {results.map((r) => (
-                    <button key={r.videoId} onClick={() => addFromResult(r)} style={{ ...queueRow, cursor: "pointer", textAlign: "left", width: "100%" }}>
-                      <img src={r.thumb} alt="" style={{ width: 54, height: 40, objectFit: "cover", borderRadius: 7, flexShrink: 0 }} />
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <div style={{ fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.title}</div>
-                        <div style={{ fontSize: 12, color: C.muted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.channel}</div>
-                      </div>
-                      <Plus size={16} />
-                    </button>
-                  ))}
-                </div>
-              )}
+              <button onClick={() => queueVideo(STARTER_VIDEO_ID)} style={quickAddBtn}>
+                <Plus size={16} /> เพิ่มเพลง"เหตุผล-TMD"
+              </button>
+              <p style={{ ...oneLine, color: err && !searching ? C.accent : C.muted, fontSize: 13, height: 18, lineHeight: "18px", margin: "8px 2px 0" }} title={err}>
+                {searching ? "กำลังค้นหา…" : err || " "}
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, height: 300, overflowY: "auto" }}>
+                {results.length === 0 && (
+                  <div style={{ color: C.muted, fontSize: 13, margin: "auto", textAlign: "center", lineHeight: 1.6 }}>ผลการค้นหาจะแสดงที่นี่</div>
+                )}
+                {results.map((r) => (
+                  <button key={r.videoId} onClick={() => addFromResult(r)} style={{ ...queueRow, cursor: "pointer", textAlign: "left", width: "100%" }}>
+                    <img src={r.thumb} alt="" style={{ width: 54, height: 40, objectFit: "cover", borderRadius: 7, flexShrink: 0 }} />
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.title}</div>
+                      <div style={{ fontSize: 12, color: C.muted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.channel}</div>
+                    </div>
+                    <Plus size={16} />
+                  </button>
+                ))}
+              </div>
             </div>
           </section>
 
           {/* queue */}
           <section style={{ ...card, display: "flex", flexDirection: "column" }}>
             <div style={{ ...eyebrow, marginBottom: 14 }}><ListM size={16} /><span>คิวถัดไป · {shared.queue.length}</span></div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", maxHeight: 460 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", height: 460 }}>
               {shared.queue.length === 0 && (
                 <div style={{ color: C.muted, fontSize: 14, padding: "24px 6px", textAlign: "center", lineHeight: 1.6 }}>
                   คิวว่างอยู่<br />ช่วยกันวางลิงก์เพลงถัดไปได้เลย
@@ -608,7 +658,7 @@ function Room({ profile, room }) {
                   <img src={thumb(s.videoId)} alt="" style={{ width: 54, height: 40, objectFit: "cover", borderRadius: 7, flexShrink: 0 }} />
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontSize: 14, color: C.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.title || "เพลง YouTube"}</div>
-                    <div style={{ fontSize: 12, color: C.muted }}>{s.addedBy}</div>
+                    <div style={{ ...oneLine, fontSize: 12, color: C.muted }}>{s.addedBy}</div>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 2, flexShrink: 0 }}>
                     <button onClick={() => moveSong(s.playId, -1)} disabled={i === 0} style={{ ...rowMove, opacity: i === 0 ? 0.3 : 1 }} title="เลื่อนขึ้น"><ChevUp size={14} /></button>
@@ -646,7 +696,8 @@ function EqBars({ active }) {
 /* ------------------------------ styles ------------------------------ */
 const page = { minHeight: "100vh", background: "radial-gradient(1200px 600px at 20% -10%, #2a1e45 0%, " + C.bg + " 45%, " + C.bg2 + " 100%)", color: C.text };
 const logoBadge = { width: 36, height: 36, borderRadius: 12, flexShrink: 0, background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", display: "flex", alignItems: "center", justifyContent: "center", color: "#12101d", boxShadow: "0 6px 20px rgba(255,111,97,.35)" };
-const grid = { display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: 18 };
+const oneLine = { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" };
+const grid = { display: "grid", gridTemplateColumns: "minmax(0, 1.5fr) minmax(0, 1fr)", gap: 18 };
 const card = { background: C.panel, border: "1px solid " + C.line, borderRadius: 18, padding: 18 };
 const eyebrow = { display: "flex", alignItems: "center", gap: 8, color: C.muted, fontSize: 12, letterSpacing: 2, textTransform: "uppercase", marginBottom: 12 };
 const playerWrap = { position: "relative", width: "100%", aspectRatio: "16 / 9", background: C.bg2, borderRadius: 14, overflow: "hidden" };
@@ -655,6 +706,7 @@ const emptyPlayer = { position: "absolute", inset: 0, display: "flex", flexDirec
 const tapOverlay = { position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(12,10,22,.55)", border: 0, cursor: "pointer", borderRadius: 14 };
 const lbl = { display: "block", fontSize: 12.5, color: C.muted, marginBottom: 6, letterSpacing: 0.3 };
 const inp = { width: "100%", padding: "12px 14px", borderRadius: 12, background: C.panel2, border: "1px solid " + C.line, color: C.text, fontSize: 15, outline: "none" };
+const quickAddBtn = { display: "inline-flex", alignItems: "center", gap: 6, marginTop: 10, padding: "9px 14px", borderRadius: 12, background: C.panel2, border: "1px solid " + C.line, color: C.text, fontSize: 14, fontWeight: 600, cursor: "pointer" };
 const primaryBtn = { display: "inline-flex", alignItems: "center", gap: 6, padding: "12px 16px", borderRadius: 12, background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", color: "#fff", border: 0, fontSize: 15, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 6px 18px rgba(139,109,255,.32)" };
 const ctrlBtn = { width: 46, height: 46, borderRadius: 14, border: 0, cursor: "pointer", background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" };
 const ctrlBtnGhost = { width: 44, height: 44, borderRadius: 14, cursor: "pointer", background: C.panel2, border: "1px solid " + C.line, color: C.text, display: "flex", alignItems: "center", justifyContent: "center" };
