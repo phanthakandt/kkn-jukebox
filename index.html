@@ -62,6 +62,7 @@ const firebaseConfig = {
 // songs queued automatically when a new room is created
 const STARTER_VIDEO_ID = "LCuxGozZh7c";
 const STARTER_REPEAT = 10;
+const STARTER_PLAYLIST_ID = "PLChLLNipV1dYPjyn8GJJ9YCKGewjv4Vsp"; // ปุ่มเพิ่มเพลย์ลิสต์ (สุ่มลำดับ)
 const YOUTUBE_API_KEY = "AIzaSyDHGG5AXtIMyXsuW3H1UKGfaOfLKxgCp_w";
 /* ===================================================================== */
 
@@ -75,7 +76,8 @@ if (!NEEDS_SETUP) {
   db.ref(".info/serverTimeOffset").on("value", (s) => { serverOffset = s.val() || 0; });
 }
 const ONLINE_MS = 30000; // a member counts as online if their heartbeat is newer than this
-const ENDED_SLACK_SEC = 8; // how early an "ended" report may arrive and still advance the queue
+const ENDED_SLACK_SEC = 3; // how early an "ended" report may arrive and still advance the queue
+const DRIFT_SEC = 3; // re-seek to the room's position when playback starts this far off it
 const serverNow = () => Date.now() + serverOffset;
 
 const { useState, useEffect, useRef, useCallback } = React;
@@ -99,6 +101,15 @@ function extractVideoId(raw) {
     /\/live\/([a-zA-Z0-9_-]{11})/, /\/v\/([a-zA-Z0-9_-]{11})/,
   ];
   for (const p of pats) { const m = url.match(p); if (m) return m[1]; }
+  return null;
+}
+// ลิงก์เพลย์ลิสต์ (YouTube / YouTube Music) ที่ไม่ได้ชี้ไปเพลงเดียว เช่น music.youtube.com/playlist?list=...
+function extractPlaylistId(raw) {
+  if (!raw) return null;
+  const url = raw.trim();
+  const m = url.match(/[?&]list=([a-zA-Z0-9_-]{10,})/);
+  if (!m) return null;
+  if (/\/playlist\b/.test(url) || !/[?&]v=/.test(url)) return m[1];
   return null;
 }
 const thumb = (id) => "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg";
@@ -143,6 +154,29 @@ async function searchYouTube(query) {
         };
       });
   } catch (e) { return []; }
+}
+
+async function fetchPlaylist(listId, max = 200) {
+  if (!YOUTUBE_API_KEY) return { error: "nokey", items: [] };
+  const items = [];
+  let pageToken = "";
+  try {
+    do {
+      const url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId="
+        + encodeURIComponent(listId) + (pageToken ? "&pageToken=" + pageToken : "") + "&key=" + YOUTUBE_API_KEY;
+      const r = await fetch(url);
+      if (!r.ok) return { error: "fail", items };
+      const j = await r.json();
+      for (const it of j.items || []) {
+        const sn = it.snippet || {};
+        const id = sn.resourceId && sn.resourceId.videoId;
+        if (!id || sn.title === "Private video" || sn.title === "Deleted video") continue;
+        items.push({ videoId: id, title: decodeHtml(sn.title) });
+      }
+      pageToken = j.nextPageToken || "";
+    } while (pageToken && items.length < max);
+  } catch (e) { return { error: "fail", items }; }
+  return { items: items.slice(0, max) };
 }
 
 /* ------------------------------- icons ------------------------------- */
@@ -328,6 +362,7 @@ function Room({ profile, room }) {
   const [apiFailed, setApiFailed] = useState(false);
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
+  const [loadingList, setLoadingList] = useState(false);
 
   /* atomic mutate via Firebase transaction */
   const mutate = useCallback((fn) => {
@@ -422,9 +457,18 @@ function Room({ profile, room }) {
       setTimeout(() => advance(ended, duration), 250 + Math.random() * 700);
     } else if (e.data === YT.PlayerState.PLAYING) {
       setIsPlaying(true); setNeedsTap(false);
+      const np = sharedRef.current.nowPlaying;
+      // resuming after a pause, a late tap-to-play, an ad or buffering leaves this player behind
+      // the room clock; catch up now instead of getting cut off when someone else's song ends
+      try {
+        const p = playerRef.current;
+        if (np && np.playId === curPlayId.current) {
+          const elapsed = Math.max(0, (serverNow() - np.startedAt) / 1000);
+          if (Math.abs(p.getCurrentTime() - elapsed) > DRIFT_SEC) p.seekTo(elapsed, true);
+        }
+      } catch (e2) {}
       try {
         const d = playerRef.current.getVideoData();
-        const np = sharedRef.current.nowPlaying;
         if (d && d.title && np && !np.title) {
           mutate((s) => {
             if (s.nowPlaying && s.nowPlaying.playId === np.playId && !s.nowPlaying.title) {
@@ -501,6 +545,24 @@ function Room({ profile, room }) {
       });
     }
   };
+  const queuePlaylist = async (listId, shuffle) => {
+    if (!YOUTUBE_API_KEY) { setErr("เพิ่มเพลย์ลิสต์ต้องตั้งค่า YOUTUBE_API_KEY ก่อน (ดูคอมเมนต์บนสุดของโค้ด)"); return; }
+    setErr(""); setResults([]); setLoadingList(true);
+    const { items, error } = await fetchPlaylist(listId);
+    setLoadingList(false);
+    if (!items.length) {
+      setErr(error ? "โหลดเพลย์ลิสต์ไม่ได้ (ต้องเป็นสาธารณะหรือไม่แสดง และใช้มิกซ์อัตโนมัติไม่ได้)" : "เพลย์ลิสต์นี้ไม่มีเพลงที่เล่นได้");
+      return false;
+    }
+    if (shuffle) {
+      for (let i = items.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [items[i], items[j]] = [items[j], items[i]]; }
+    }
+    const now = serverNow();
+    const songs = items.map((it, i) => ({ playId: uid(), videoId: it.videoId, title: it.title || null, addedBy: profile.name, addedById: profile.id, addedAt: now + i }));
+    mutate((s) => { s.queue = [...(s.queue || []), ...songs]; return s; });
+    setErr("เพิ่ม " + songs.length + " เพลงจากเพลย์ลิสต์เข้าคิวแล้ว" + (shuffle ? " (สุ่มลำดับ)" : ""));
+    return true;
+  };
   const runSearch = async (query) => {
     if (!YOUTUBE_API_KEY) { setErr("ค้นหาเพลงต้องตั้งค่า YOUTUBE_API_KEY ก่อน (ดูคอมเมนต์บนสุดของโค้ด) หรือวางลิงก์ YouTube แทน"); return; }
     setErr(""); setSearching(true);
@@ -512,6 +574,8 @@ function Room({ profile, room }) {
   const addSong = () => {
     const raw = input.trim();
     if (!raw) return;
+    const listId = extractPlaylistId(raw);
+    if (listId) { queuePlaylist(listId).then((ok) => ok && setInput("")); return; }
     const id = extractVideoId(raw);
     if (id) { queueVideo(id); setInput(""); setErr(""); setResults([]); return; }
     runSearch(raw);
@@ -613,17 +677,20 @@ function Room({ profile, room }) {
               <div style={{ display: "flex", gap: 8 }}>
                 <input style={{ ...inp, marginTop: 0, flex: 1 }} value={input}
                   onChange={(e) => { setInput(e.target.value); setErr(""); }}
-                  onKeyDown={(e) => e.key === "Enter" && addSong()} placeholder="วางลิงก์ YouTube หรือพิมพ์ชื่อเพลงเพื่อค้นหา…" />
-                <button onClick={addSong} style={{ ...primaryBtn, width: 112, justifyContent: "center" }} disabled={searching}>
-                  {extractVideoId(input) ? <Plus size={18} /> : <SearchI size={18} />}
-                  {extractVideoId(input) ? " เข้าคิว" : " ค้นหา"}
+                  onKeyDown={(e) => e.key === "Enter" && addSong()} placeholder="วางลิงก์ YouTube / เพลย์ลิสต์ หรือพิมพ์ชื่อเพลงเพื่อค้นหา…" />
+                <button onClick={addSong} style={{ ...primaryBtn, width: 112, justifyContent: "center" }} disabled={searching || loadingList}>
+                  {extractPlaylistId(input) || extractVideoId(input) ? <Plus size={18} /> : <SearchI size={18} />}
+                  {extractPlaylistId(input) || extractVideoId(input) ? " เข้าคิว" : " ค้นหา"}
                 </button>
               </div>
               <button onClick={() => queueVideo(STARTER_VIDEO_ID)} style={quickAddBtn}>
                 <Plus size={16} /> เพิ่มเพลง"เหตุผล-TMD"
               </button>
-              <p style={{ ...oneLine, color: err && !searching ? C.accent : C.muted, fontSize: 13, height: 18, lineHeight: "18px", margin: "8px 2px 0" }} title={err}>
-                {searching ? "กำลังค้นหา…" : err || " "}
+              <button onClick={() => queuePlaylist(STARTER_PLAYLIST_ID, true)} disabled={loadingList} style={{ ...quickAddBtn, marginLeft: 8, opacity: loadingList ? 0.5 : 1 }}>
+                <ListM size={16} /> เพิ่มเพลย์ลิสต์ (สุ่มลำดับ)
+              </button>
+              <p style={{ ...oneLine, color: err && !searching && !loadingList ? C.accent : C.muted, fontSize: 13, height: 18, lineHeight: "18px", margin: "8px 2px 0" }} title={err}>
+                {searching ? "กำลังค้นหา…" : loadingList ? "กำลังโหลดเพลย์ลิสต์…" : err || " "}
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, height: 300, overflowY: "auto" }}>
                 {results.length === 0 && (
