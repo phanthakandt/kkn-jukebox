@@ -62,9 +62,7 @@ const firebaseConfig = {
    → Credentials → Create API key
    ถ้าปล่อยว่างไว้ ยังวางลิงก์ YouTube เข้าคิวได้ตามปกติ แค่ค้นหาด้วยชื่อเพลงไม่ได้
    ===================================================================== */
-// songs queued automatically when a new room is created
-const STARTER_VIDEO_ID = "LCuxGozZh7c";
-const STARTER_REPEAT = 10;
+const STARTER_VIDEO_ID = "LCuxGozZh7c"; // ปุ่มเพิ่มเพลงด่วน
 const STARTER_PLAYLIST_ID = "PLChLLNipV1dYPjyn8GJJ9YCKGewjv4Vsp"; // ปุ่มเพิ่มเพลย์ลิสต์ (สุ่มลำดับ)
 const YOUTUBE_API_KEY = "AIzaSyDHGG5AXtIMyXsuW3H1UKGfaOfLKxgCp_w";
 /* ===================================================================== */
@@ -294,45 +292,23 @@ function JoinScreen({ profile, onJoin }) {
 
 /* ============================ ROOM GATE ============================= */
 /* A room with nobody online counts as closed: the next person to enter wipes the old
-   data (queue, now playing, host) and starts it fresh as host, seeded with the starter song. */
+   data (queue, now playing, host) and starts it fresh as host. */
 function RoomGate({ profile, room }) {
   const [ready, setReady] = useState(false);
   useEffect(() => {
     let cancelled = false;
     const roomRef = db.ref("rooms/" + room);
-    let fresh = false;
     roomRef.transaction((cur) => {
       const members = (cur && cur.members) || {};
       const someoneHere = Object.keys(members).some((id) => serverNow() - ((members[id] || {}).lastSeen || 0) < ONLINE_MS);
-      fresh = !someoneHere;
       if (someoneHere) return undefined;
-      const at = serverNow();
       return {
         hostId: profile.id,
-        members: { [profile.id]: { name: profile.name, lastSeen: at } },
-        state: {
-          nowPlaying: null,
-          queue: Array.from({ length: STARTER_REPEAT }, (_, i) => ({
-            playId: uid(), videoId: STARTER_VIDEO_ID, title: null,
-            addedBy: profile.name, addedById: profile.id, addedAt: at + i,
-          })),
-        },
+        members: { [profile.id]: { name: profile.name, lastSeen: serverNow() } },
+        state: { nowPlaying: null, queue: [] },
       };
-    }, (error, committed) => {
-      if (cancelled) return;
-      setReady(true);
-      if (error || !committed || !fresh) return;
-      fetchTitle(STARTER_VIDEO_ID).then((title) => {
-        if (!title) return;
-        db.ref("rooms/" + room + "/state").transaction((st) => {
-          if (!st) return undefined;
-          let hit = false;
-          const fill = (x) => (x && x.videoId === STARTER_VIDEO_ID && !x.title ? (hit = true, Object.assign({}, x, { title })) : x);
-          st.queue = normQueue(st.queue).map(fill);
-          st.nowPlaying = fill(st.nowPlaying || null);
-          return hit ? st : undefined;
-        });
-      });
+    }, () => {
+      if (!cancelled) setReady(true);
     }, false);
     return () => { cancelled = true; };
   }, [room, profile]);
@@ -366,6 +342,7 @@ function Room({ profile, room }) {
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [loadingList, setLoadingList] = useState(false);
+  const [playNext, setPlayNext] = useState(false); // new songs go to the front of the queue instead of the end
 
   /* atomic mutate via Firebase transaction */
   const mutate = useCallback((fn) => {
@@ -533,9 +510,13 @@ function Room({ profile, room }) {
   }, [shared.nowPlaying, shared.queue, mutate]);
 
   /* ---------------------------- actions ---------------------------- */
+  const enqueue = (songs) => mutate((s) => {
+    s.queue = playNext ? [...songs, ...(s.queue || [])] : [...(s.queue || []), ...songs];
+    return s;
+  });
   const queueVideo = (id, titleGuess) => {
     const song = { playId: uid(), videoId: id, title: titleGuess || null, addedBy: profile.name, addedById: profile.id, addedAt: serverNow() };
-    mutate((s) => { s.queue = [...(s.queue || []), song]; return s; });
+    enqueue([song]);
     if (!titleGuess) {
       fetchTitle(id).then((title) => {
         if (!title) return;
@@ -562,8 +543,8 @@ function Room({ profile, room }) {
     }
     const now = serverNow();
     const songs = items.map((it, i) => ({ playId: uid(), videoId: it.videoId, title: it.title || null, addedBy: profile.name, addedById: profile.id, addedAt: now + i }));
-    mutate((s) => { s.queue = [...(s.queue || []), ...songs]; return s; });
-    setErr("เพิ่ม " + songs.length + " เพลงจากเพลย์ลิสต์เข้าคิวแล้ว" + (shuffle ? " (สุ่มลำดับ)" : ""));
+    enqueue(songs);
+    setErr("เพิ่ม " + songs.length + " เพลงจากเพลย์ลิสต์" + (playNext ? "ให้เล่นถัดไปแล้ว" : "เข้าคิวแล้ว") + (shuffle ? " (สุ่มลำดับ)" : ""));
     return true;
   };
   const runSearch = async (query) => {
@@ -686,6 +667,14 @@ function Room({ profile, room }) {
                   {extractPlaylistId(input) || extractVideoId(input) ? " เข้าคิว" : " ค้นหา"}
                 </button>
               </div>
+              <div style={{ display: "flex", gap: 4, marginTop: 10, padding: 4, borderRadius: 12, background: C.panel2, border: "1px solid " + C.line }}>
+                <button onClick={() => setPlayNext(false)} aria-pressed={!playNext} style={!playNext ? segBtnOn : segBtn} title="เพลงที่เพิ่มจะไปต่อท้ายคิว">
+                  <ListM size={16} /> ต่อท้ายคิว
+                </button>
+                <button onClick={() => setPlayNext(true)} aria-pressed={playNext} style={playNext ? segBtnOn : segBtn} title="เพลงที่เพิ่มจะเล่นต่อจากเพลงปัจจุบัน">
+                  <Skip size={16} /> เล่นถัดไป
+                </button>
+              </div>
               <button onClick={() => queueVideo(STARTER_VIDEO_ID)} style={quickAddBtn}>
                 <Plus size={16} /> เพิ่มเพลง"เหตุผล-TMD"
               </button>
@@ -778,6 +767,8 @@ const tapOverlay = { position: "absolute", inset: 0, display: "flex", flexDirect
 const lbl = { display: "block", fontSize: 12.5, color: C.muted, marginBottom: 6, letterSpacing: 0.3 };
 const inp = { width: "100%", padding: "12px 14px", borderRadius: 12, background: C.panel2, border: "1px solid " + C.line, color: C.text, fontSize: 15, outline: "none" };
 const quickAddBtn = { display: "inline-flex", alignItems: "center", gap: 6, marginTop: 10, padding: "9px 14px", borderRadius: 12, background: C.panel2, border: "1px solid " + C.line, color: C.text, fontSize: 14, fontWeight: 600, cursor: "pointer" };
+const segBtn = { flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "7px 10px", borderRadius: 9, background: "transparent", border: 0, color: C.muted, fontSize: 14, fontWeight: 600, cursor: "pointer" };
+const segBtnOn = { ...segBtn, background: C.accent, color: "#fff" };
 const primaryBtn = { display: "inline-flex", alignItems: "center", gap: 6, padding: "12px 16px", borderRadius: 12, background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", color: "#fff", border: 0, fontSize: 15, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 6px 18px rgba(139,109,255,.32)" };
 const ctrlBtn = { width: 46, height: 46, borderRadius: 14, border: 0, cursor: "pointer", background: "linear-gradient(135deg, " + C.accent + ", " + C.accent2 + ")", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" };
 const ctrlBtnGhost = { width: 44, height: 44, borderRadius: 14, cursor: "pointer", background: C.panel2, border: "1px solid " + C.line, color: C.text, display: "flex", alignItems: "center", justifyContent: "center" };
